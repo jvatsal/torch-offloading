@@ -17,7 +17,6 @@ class OffloadActivations(saved_tensors_hooks):
 
     self.comm_stream = torch.cuda.Stream()
 
-    # Specify type of map
     self.offloaded_activations: dict[int, OffloadedActivation] = {}
     self.id = 0
 
