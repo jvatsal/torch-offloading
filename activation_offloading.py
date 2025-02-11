@@ -55,10 +55,7 @@ class OffloadActivations(saved_tensors_hooks):
 tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
 model = AutoModel.from_pretrained("bert-base-uncased").cuda()
 
-inputs = tokenizer("Hello, how are you?", return_tensors="pt")
-for key, val in inputs.items():
-    if val.is_floating_point():
-        inputs[key] = val.cuda().requires_grad_()
+inputs = tokenizer("Hello, how are you?", return_tensors="pt").to("cuda")
 
 context_manager = OffloadActivations(min_offload_size=1024, use_pin_memory=True)
 
