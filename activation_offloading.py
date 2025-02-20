@@ -9,13 +9,15 @@ from dataclasses import dataclass
 class OffloadedActivation:
   tensor: torch.Tensor
   is_offloaded: bool
+  event: torch.cuda.Event = None
 
 class OffloadActivations(saved_tensors_hooks):
-  def __init__(self, min_offload_size: int =1024, use_pin_memory: bool = True):
+  def __init__(self, min_offload_size: int=1024, use_pin_memory: bool = True):
     self.min_offload_size = min_offload_size
     self.use_pin_memory = use_pin_memory
     self.offloaded_activations: dict[int, OffloadedActivation] = {}
     self.id = 0
+    self.comm_stream = torch.cuda.Stream()
     super().__init__(self.pack_tensor, self.unpack_tensor)
 
   def pack_tensor(self, activation: torch.Tensor) -> int:
@@ -43,20 +45,3 @@ class OffloadActivations(saved_tensors_hooks):
     else:
       print(f"unpack_tensor: id={activation_id} no offloading needed")
       return offloaded_act.tensor
-
-tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
-model = AutoModel.from_pretrained("bert-base-uncased").cuda()
-
-inputs = tokenizer("Hello, how are you?", return_tensors="pt").to("cuda")
-
-context_manager = OffloadActivations(min_offload_size=1024, use_pin_memory=True)
-
-with context_manager:
-  with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-                 profile_memory=True, record_shapes=True) as prof:
-        outputs = model(**inputs)
-        loss = outputs.last_hidden_state.mean()
-        loss.backward()
-
-print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=20))
-prof.export_chrome_trace("trace.json")
