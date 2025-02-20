@@ -27,8 +27,12 @@ class OffloadActivations(saved_tensors_hooks):
     print(f"pack_tensor: id={currId}, size={size} bytes, device={activation.device}")
 
     if size >= self.min_offload_size and activation.is_cuda:
-      cpu_tensor = activation.cpu()  # This is synchronous
-      self.offloaded_activations[currId] = OffloadedActivation(cpu_tensor, True)
+      with torch.cuda.stream(self.comm_stream):
+        cpu_tensor = torch.empty_like(activation, pin_memory=self.use_pin_memory, device="cpu")
+        cpu_tensor.copy_(activation, non_blocking=True)
+        # self.comm_stream.synchronize()
+        event = self.comm_stream.record_event()
+        self.offloaded_activations[currId] = OffloadedActivation(cpu_tensor, True, event=event)
     else:
       self.offloaded_activations[currId] = OffloadedActivation(activation, False)
 
@@ -39,7 +43,12 @@ class OffloadActivations(saved_tensors_hooks):
       raise RuntimeError("Lost Tensor")
     offloaded_act = self.offloaded_activations.pop(activation_id)
     if offloaded_act.is_offloaded:
-      gpu_tensor = offloaded_act.tensor.cuda()
+      torch.cuda.current_stream().wait_event(offloaded_act.event)
+      with torch.cuda.stream(self.comm_stream):
+        gpu_tensor = offloaded_act.tensor.to("cuda", non_blocking=True)
+        # self.comm_stream.synchronize()
+      torch.cuda.current_stream().wait_stream(self.comm_stream)
+      # torch.cuda.current_stream().wait_event(offloaded_act.event)
       print(f"unpack_tensor: id={activation_id} restored from CPU to GPU")
       return gpu_tensor
     else:
