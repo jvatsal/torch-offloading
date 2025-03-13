@@ -24,9 +24,14 @@ class OffloadActivations(saved_tensors_hooks):
     self.id += 1
     currId = self.id
     size = activation.nelement() * activation.element_size()
-    print(f"pack_tensor: id={currId}, size={size} bytes, device={activation.device}")
 
-    if size >= self.min_offload_size and activation.is_cuda:
+    if (
+      size >= self.min_offload_size 
+      and activation.is_cuda 
+      and not isinstance(activation, (torch.nn.Parameter, torch.nn.Buffer))
+    ):
+      self.comm_stream.wait_stream(torch.cuda.default_stream())
+      
       with torch.cuda.stream(self.comm_stream):
         cpu_tensor = torch.empty_like(activation, pin_memory=self.use_pin_memory, device="cpu")
         cpu_tensor.copy_(activation, non_blocking=True)
@@ -35,6 +40,9 @@ class OffloadActivations(saved_tensors_hooks):
     else:
       self.offloaded_activations[currId] = OffloadedActivation(activation, False)
 
+    # self.comm_stream.synchronize()
+    # torch.cuda.synchronize()
+    # torch.cuda.default_stream().synchronize()
     return currId
 
   def unpack_tensor(self, activation_id: int) -> torch.Tensor:
@@ -43,11 +51,14 @@ class OffloadActivations(saved_tensors_hooks):
     offloaded_act = self.offloaded_activations.pop(activation_id)
     if offloaded_act.is_offloaded:
       with torch.cuda.stream(self.comm_stream):
+        # offloaded_act.event.synchronize()
         self.comm_stream.wait_event(offloaded_act.event)
         gpu_tensor = offloaded_act.tensor.to("cuda", non_blocking=True)
-      torch.cuda.current_stream().wait_stream(self.comm_stream)
-      print(f"unpack_tensor: id={activation_id} restored from CPU to GPU")
+        del offloaded_act.tensor
+
+      # torch.cuda.default_stream().wait_stream(self.comm_stream)
+      # self.comm_stream.synchronize()
+      # torch.cuda.current_stream().wait_stream(self.comm_stream)
       return gpu_tensor
     else:
-      print(f"unpack_tensor: id={activation_id} no offloading needed")
       return offloaded_act.tensor

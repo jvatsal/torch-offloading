@@ -1,4 +1,5 @@
 import os
+import copy
 os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":16:8"
 import torch
 import pytest
@@ -40,12 +41,12 @@ def run_model(
   """
   model.zero_grad()
 
-  with OffloadActivations(min_offload_size=1024, use_pin_memory=True) if use_offloading else contextlib.nullcontext():
+  with OffloadActivations() if use_offloading else contextlib.nullcontext():
+    model.gradient_checkpointing_enable({"use_reentrant": False})
+
     outputs = model(**inputs)
     loss = outputs.last_hidden_state.mean()
     loss.backward()
-
-  torch.cuda.synchronize()
 
   grad = {}
   for name, param in model.named_parameters():
@@ -57,12 +58,13 @@ def run_model(
 def test_activation_offloading_accuracy() -> None:
   """Runs the model with and without activation offloading and compares the loss and gradients."""
 
-  torch.manual_seed(2024)
   model_no_offloading, inputs_no_offloading = get_model()
-  torch.manual_seed(2024)
-  model_with_offloading, inputs_with_offloading = get_model()
+  model_with_offloading = copy.deepcopy(model_no_offloading)
+  inputs_with_offloading = copy.deepcopy(inputs_no_offloading)
 
+  torch.manual_seed(2024)
   loss_no_offloading, grad_no_offloading = run_model(model_no_offloading, inputs_no_offloading, use_offloading=False)
+  torch.manual_seed(2024)
   loss_with_offloading, grad_with_offloading = run_model(model_with_offloading, inputs_with_offloading, use_offloading=True)
 
   atol = rtol = 1e-5
