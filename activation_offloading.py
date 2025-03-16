@@ -39,26 +39,20 @@ class OffloadActivations(saved_tensors_hooks):
         self.offloaded_activations[currId] = OffloadedActivation(cpu_tensor, True, event=event)
     else:
       self.offloaded_activations[currId] = OffloadedActivation(activation, False)
-
-    # self.comm_stream.synchronize()
-    # torch.cuda.synchronize()
-    # torch.cuda.default_stream().synchronize()
     return currId
 
   def unpack_tensor(self, activation_id: int) -> torch.Tensor:
+    self.comm_stream.wait_stream(torch.cuda.default_stream())
+    
     if activation_id not in self.offloaded_activations:
       raise RuntimeError("Lost Tensor")
     offloaded_act = self.offloaded_activations.pop(activation_id)
     if offloaded_act.is_offloaded:
-      with torch.cuda.stream(self.comm_stream):
-        # offloaded_act.event.synchronize()
+      with torch.cuda.stream(self.comm_stream), torch.cuda.nvtx.range(f"offloading {activation_id}"):
         self.comm_stream.wait_event(offloaded_act.event)
         gpu_tensor = offloaded_act.tensor.to("cuda", non_blocking=True)
-        del offloaded_act.tensor
 
-      # torch.cuda.default_stream().wait_stream(self.comm_stream)
-      # self.comm_stream.synchronize()
-      # torch.cuda.current_stream().wait_stream(self.comm_stream)
+      torch.cuda.default_stream().wait_stream(self.comm_stream)
       return gpu_tensor
     else:
       return offloaded_act.tensor

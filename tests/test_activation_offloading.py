@@ -26,7 +26,10 @@ def get_model() -> Tuple[AutoModel, Dict[str, torch.Tensor]]:
   model = AutoModel.from_pretrained("meta-llama/Llama-3.2-1B").to(dtype=torch.float32, device="cuda")
   # model = AutoModel.from_pretrained("meta-llama/Llama-3.2-1B").to(dtype=torch.bfloat16, device="cuda")
   model.train()
-  inputs = tokenizer("Hello, how are you?", return_tensors="pt").to("cuda")
+  # inputs = tokenizer("Hello, how are you?", return_tensors="pt").to("cuda")
+  inputs = {}
+  inputs["input_ids"] = torch.randint(0, 2000, (2, 4096), dtype=torch.long, device="cuda")
+  inputs["attention_mask"] = torch.ones(2, 4096, dtype=torch.long, device="cuda")
   return model, inputs
 
 def run_model(
@@ -42,11 +45,13 @@ def run_model(
   model.zero_grad()
 
   with OffloadActivations() if use_offloading else contextlib.nullcontext():
-    model.gradient_checkpointing_enable({"use_reentrant": False})
+    # model.gradient_checkpointing_enable({"use_reentrant": False})
 
     outputs = model(**inputs)
     loss = outputs.last_hidden_state.mean()
     loss.backward()
+
+  torch.cuda.synchronize()
 
   grad = {}
   for name, param in model.named_parameters():
@@ -62,10 +67,16 @@ def test_activation_offloading_accuracy() -> None:
   model_with_offloading = copy.deepcopy(model_no_offloading)
   inputs_with_offloading = copy.deepcopy(inputs_no_offloading)
 
-  torch.manual_seed(2024)
-  loss_no_offloading, grad_no_offloading = run_model(model_no_offloading, inputs_no_offloading, use_offloading=False)
-  torch.manual_seed(2024)
-  loss_with_offloading, grad_with_offloading = run_model(model_with_offloading, inputs_with_offloading, use_offloading=True)
+  assert torch.equal(inputs_no_offloading["input_ids"], inputs_with_offloading["input_ids"])
+  assert torch.equal(inputs_no_offloading["attention_mask"], inputs_with_offloading["attention_mask"])
+
+
+  with torch.cuda.nvtx.range("No Offloading"):
+    torch.manual_seed(2024)
+    loss_no_offloading, grad_no_offloading = run_model(model_no_offloading, inputs_no_offloading, use_offloading=False)
+  with torch.cuda.nvtx.range("With Offloading"):
+    torch.manual_seed(2024)
+    loss_with_offloading, grad_with_offloading = run_model(model_with_offloading, inputs_with_offloading, use_offloading=True)
 
   atol = rtol = 1e-5
 
@@ -93,3 +104,6 @@ def test_activation_offloading_accuracy() -> None:
   gc.collect()
   print(torch.cuda.memory_summary(device=None, abbreviated=False))
   print("passed!")
+
+if __name__ == "__main__":
+  test_activation_offloading_accuracy()
