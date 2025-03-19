@@ -24,35 +24,24 @@ class OffloadActivations(saved_tensors_hooks):
     self.id += 1
     currId = self.id
     size = activation.nelement() * activation.element_size()
+    print(f"pack_tensor: id={currId}, size={size} bytes, device={activation.device}")
 
-    if (
-      size >= self.min_offload_size 
-      and activation.is_cuda 
-      and not isinstance(activation, (torch.nn.Parameter, torch.nn.Buffer))
-    ):
-      self.comm_stream.wait_stream(torch.cuda.default_stream())
-      
-      with torch.cuda.stream(self.comm_stream):
-        cpu_tensor = torch.empty_like(activation, pin_memory=self.use_pin_memory, device="cpu")
-        cpu_tensor.copy_(activation, non_blocking=True)
-        event = self.comm_stream.record_event()
-        self.offloaded_activations[currId] = OffloadedActivation(cpu_tensor, True, event=event)
+    if size >= self.min_offload_size and activation.is_cuda:
+      cpu_tensor = activation.cpu()  # This is synchronous
+      self.offloaded_activations[currId] = OffloadedActivation(cpu_tensor, True)
     else:
       self.offloaded_activations[currId] = OffloadedActivation(activation, False)
+
     return currId
 
   def unpack_tensor(self, activation_id: int) -> torch.Tensor:
-    self.comm_stream.wait_stream(torch.cuda.default_stream())
-    
     if activation_id not in self.offloaded_activations:
       raise RuntimeError("Lost Tensor")
     offloaded_act = self.offloaded_activations.pop(activation_id)
     if offloaded_act.is_offloaded:
-      with torch.cuda.stream(self.comm_stream), torch.cuda.nvtx.range(f"offloading {activation_id}"):
-        self.comm_stream.wait_event(offloaded_act.event)
-        gpu_tensor = offloaded_act.tensor.to("cuda", non_blocking=True)
-
-      torch.cuda.default_stream().wait_stream(self.comm_stream)
+      gpu_tensor = offloaded_act.tensor.cuda()
+      print(f"unpack_tensor: id={activation_id} restored from CPU to GPU")
       return gpu_tensor
     else:
+      print(f"unpack_tensor: id={activation_id} no offloading needed")
       return offloaded_act.tensor

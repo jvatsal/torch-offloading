@@ -14,11 +14,11 @@ login(token=os.environ["HUGGINGFACE_TOKEN"])
 
 from activation_offloading import OffloadActivations
 
-# torch.backends.cudnn.deterministic = True
-# torch.backends.cudnn.benchmark = False
-# torch.use_deterministic_algorithms(True)
-# torch.backends.cuda.matmul.allow_tf32 = False
-# torch.backends.cudnn.allow_tf32 = False
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+torch.use_deterministic_algorithms(True)
+torch.backends.cuda.matmul.allow_tf32 = False
+torch.backends.cudnn.allow_tf32 = False
 
 def get_model() -> Tuple[AutoModel, Dict[str, torch.Tensor]]:
   """Load pretrained model and tokenize sample input. Returns model & inputs"""
@@ -45,7 +45,7 @@ def run_model(
   model.zero_grad()
 
   with OffloadActivations() if use_offloading else contextlib.nullcontext():
-    # model.gradient_checkpointing_enable({"use_reentrant": False})
+    model.gradient_checkpointing_enable({"use_reentrant": False})
 
     outputs = model(**inputs)
     loss = outputs.last_hidden_state.mean()
