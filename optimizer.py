@@ -1,8 +1,10 @@
 import torch
-from torch.optim import Optimizer
+from torch.optim.optimizer import Optimizer
 from typing import Type
+from contextlib import contextmanager
 
 """
+TODO: Add gradient accumulation
 Step 1:
     * When initializing the optimizer, it copies params (above minimal_size) to CPU
     * These CPU copies are stored and used for optimizer calcs
@@ -21,6 +23,10 @@ class CPUOffloadOptimizer(Optimizer):
         minimal_size: int = 4096,
         **kwargs,
     ) -> None:
+        
+        if optimizer_class is torch.optim.AdamW and "fused" not in kwargs:
+            kwargs.update(fused=True)
+
         params = list(params)
         if len(params) == 0: raise ValueError("empty parameter list")
         if not isinstance(params[0], dict):
@@ -44,9 +50,15 @@ class CPUOffloadOptimizer(Optimizer):
         self.gpu_params = []
         self.gpu_optimizer = None
 
+        # This flag controls whether the backward hook will offload gradients.
+        self._offload_enabled = True
+
         def backward_hook(gpu_param):
             """Intercepted the moment after a gradient is computed on a parameter"""
-            if gpu_param.grad is None: return
+            if not self._offload_enabled:
+                return
+            if gpu_param.grad is None: 
+                return
             
             cpu_param = self.gpu2cpuCopies[gpu_param]
             
@@ -101,12 +113,24 @@ class CPUOffloadOptimizer(Optimizer):
         if len(self.gpu_params) > 0:
             self.gpu_optimizer = optimizer_class(self.gpu_params, **kwargs)
 
+    @contextmanager
+    def no_offload(self):
+        """Disables offloading for gradient accumulation"""
+        old_flag = self._offload_enabled
+        self._offload_enabled = False
+        try:
+            yield
+        finally:
+            self._offload_enabled = old_flag
+
+
     @torch.no_grad()
     def step(self, closure=None):
         loss = None
         if closure is not None:
             loss = closure()
 
+        # do the optimizer step on the GPU for the small parameters
         if self.gpu_optimizer is not None: 
             self.gpu_optimizer.step()
         
@@ -116,7 +140,8 @@ class CPUOffloadOptimizer(Optimizer):
             self.optim_dict[gpu_param].step()
 
             # submit job to self.stream
-            # we guarentee that we only 
+            # this guarentees that we only move param CPU->GPU once all backwards finish
+            # self.stream will wait for current_stream when moving gradient GPU->CPU
             cpu_param = self.gpu2cpuCopies[gpu_param]
             with torch.cuda.stream(self.stream):
                 gpu_param.copy_(cpu_param, non_blocking=True)
@@ -143,12 +168,14 @@ class CPUOffloadOptimizer(Optimizer):
         """
         return sum(
             (opt.param_groups for opt in self.optim_dict.values()),
-            start=(self.gpu_optimizer.param_groups if self.gpu_optimizer else []),
+            start=(self.gpu_params),
         )
     
     def state_dict(self):
         """Returns optimizer's state dict"""
-        state_dict = {"offloaded": [optimizer.state_dict() for optimizer in self.optim_dict.values()]}
+        state_dict = {
+            "offloaded": [optimizer.state_dict() for optimizer in self.optim_dict.values()]
+        }
         if self.gpu_optimizer:
             state_dict["on-device"] = self.gpu_optimizer.state_dict()
         return state_dict

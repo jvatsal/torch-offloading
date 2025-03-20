@@ -22,8 +22,8 @@ torch.backends.cudnn.allow_tf32 = False
 def get_model() -> Tuple[AutoModel, Dict[str, torch.Tensor]]:
     """Load pretrained LLaMA model and tokenize sample input."""
     tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B")
-    # model = AutoModel.from_pretrained("meta-llama/Llama-3.2-1B").to(dtype=torch.float32, device="cuda")
-    model = AutoModel.from_pretrained("meta-llama/Llama-3.2-1B").to(dtype=torch.bfloat16, device="cuda")
+    model = AutoModel.from_pretrained("meta-llama/Llama-3.2-1B").to(dtype=torch.float32, device="cuda")
+    # model = AutoModel.from_pretrained("meta-llama/Llama-3.2-1B").to(dtype=torch.bfloat16, device="cuda")
     model.train()
     inputs = tokenizer("Hello, how are you?", return_tensors="pt").to("cuda")
     return model, inputs
@@ -57,11 +57,24 @@ def test_optim_cpu_offload_correctness(grad_accum):
 
     rng.manual_seed(42)
 
-    for _ in range(2):
-        for _ in range(grad_accum):
-            outputs = model2(**inputs2)
-            outputs.last_hidden_state.mean().backward()
+    # for _ in range(2):
+    #     for _ in range(grad_accum):
+    #         outputs = model2(**inputs2)
+    #         outputs.last_hidden_state.mean().backward()
 
+    #     optimizer2.step()
+    #     optimizer2.zero_grad()
+    #     scheduler2.step()
+
+    for _ in range(2):
+        for i in range(grad_accum):
+            if grad_accum > 1 and i < grad_accum - 1:
+                with optimizer2.no_offload():
+                    outputs = model2(**inputs2)
+                    outputs.last_hidden_state.mean().backward()
+            else:
+                outputs = model2(**inputs2)
+                outputs.last_hidden_state.mean().backward()
         optimizer2.step()
         optimizer2.zero_grad()
         scheduler2.step()
