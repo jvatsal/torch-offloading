@@ -11,7 +11,7 @@ from optimizer import CPUOffloadOptimizer
 import gc
 from torch import nn
 
-login(token=os.environ["HUGGINGFACE_TOKEN"])
+# login(token=os.environ["HUGGINGFACE_TOKEN"])
 
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
@@ -125,7 +125,7 @@ def test_ao(grad_accum):
     rng = torch.Generator(device="cuda")
     rng.manual_seed(42)
 
-    epochs = 1
+    epochs = 2
 
     # make sure to run both models separately; otherwise, model1 gives additional
     # time for operations in model2 to complete, marking potential race conditions.
