@@ -4,7 +4,6 @@ from typing import Type
 from contextlib import contextmanager
 
 """
-TODO: Add gradient accumulation
 Step 1:
     * When initializing the optimizer, it copies params (above minimal_size) to CPU
     * These CPU copies are stored and used for optimizer calcs
@@ -42,7 +41,7 @@ class CPUOffloadOptimizer(Optimizer):
         # CPU params -> optimizer
         self.optim_dict = {}
 
-        # Maintain order of which param we should do optim step on first
+        # A map to track when GPU->CPU gradient copies have completed.
         # Param -> event
         self.queue = {}
 
@@ -80,36 +79,47 @@ class CPUOffloadOptimizer(Optimizer):
             gpu_param.grad.record_stream(self.stream)
             gpu_param.grad = None
 
-        # Param shift to CPU
+            # # Free the GPU param copy now that gradient is offloaded.
+            # gpu_param.data = torch.empty(0, device=gpu_param.device, dtype=cpu_param.dtype)
+
+        # param shift to CPU
         for param_group in params:
             param = param_group.pop("params")
             retained_params = []
 
             for gpu_param in param:
                 if not gpu_param.requires_grad:
+                    retained_params.append(gpu_param)
                     continue
                 if gpu_param.numel() < self.minimal_size:
                     retained_params.append(gpu_param)
                     continue
 
-                # CPU copies of params & grads
+                # create persistent CPU master copy
                 cpu_param = torch.empty_like(gpu_param, device="cpu", pin_memory=True)
                 cpu_param.grad = torch.empty_like(cpu_param, pin_memory=True)
                 cpu_param.copy_(gpu_param.detach(), non_blocking=True)
 
                 self.gpu2cpuCopies[gpu_param] = cpu_param 
 
-                # Called after backward pass computes and accumulates the grad for this parameter
+                # TODO: need to empty it
+                # immediately free GPU copy
+                # gpu_param.data = torch.empty(0, device=gpu_param.device, dtype=cpu_param.dtype)
+                gpu_param.data = torch.zeros_like(gpu_param.data, device=gpu_param.device)
+
+                # called after backward pass computes and accumulates the grad for this parameter
                 gpu_param.register_post_accumulate_grad_hook(backward_hook)
+
+                # make CPU optimizer for this parameter
                 self.optim_dict[gpu_param] = optimizer_class(
                     [{"params": cpu_param, **param_group}], **kwargs
                 )
             
-            # Create GPU optimizer group
+            # store small params on gpu
             if len(retained_params) > 0:
                 self.gpu_params.append({"params": retained_params, **param_group})
         
-        # Use single optimizer instance for group 
+        # use single optimizer instance for small gpu params 
         if len(self.gpu_params) > 0:
             self.gpu_optimizer = optimizer_class(self.gpu_params, **kwargs)
 
@@ -139,14 +149,16 @@ class CPUOffloadOptimizer(Optimizer):
             gpu_grad_event.synchronize()
             self.optim_dict[gpu_param].step()
 
-            # submit job to self.stream
-            # this guarentees that we only move param CPU->GPU once all backwards finish
-            # self.stream will wait for current_stream when moving gradient GPU->CPU
-            cpu_param = self.gpu2cpuCopies[gpu_param]
-            with torch.cuda.stream(self.stream):
-                gpu_param.copy_(cpu_param, non_blocking=True)
+            # NOT NECESSARY
+            # # submit job to self.stream
+            # # this guarentees that we only move param CPU->GPU once all backwards finish
+            # # self.stream will wait for current_stream when moving gradient GPU->CPU
+            # cpu_param = self.gpu2cpuCopies[gpu_param]
+            # with torch.cuda.stream(self.stream):
+            #     gpu_param.copy_(cpu_param, non_blocking=True)
             
-        # Make sure all parameters are transferred from CPU->GPU before next forward pass
+        # make sure all parameters are transferred from CPU->GPU before next forward pass
+        # add a wait_stream here
         self.stream.synchronize()
         self.queue.clear()
         return loss
@@ -186,3 +198,72 @@ class CPUOffloadOptimizer(Optimizer):
         
         if self.gpu_optimizer:
             self.gpu_optimizer.load_state_dict(state_dict["on-device"])
+
+    def load_params_to_gpu(self):
+        """Before forward, load master CPU copy to GPU if needed"""
+        for gpu_param, cpu_param in self.gpu2cpuCopies.items():
+            # TODO: need to allocate space for gpu parameter tensor
+            # if gpu_param.data.numel() == 0:
+            #     gpu_param.data = torch.empty_like(cpu_param, device=gpu_param.device)
+            #     gpu_param.data.copy_(cpu_param, non_blocking=True)
+            if gpu_param.data.numel() == 0 or torch.all(gpu_param.data == 0):
+                gpu_param.data.copy_(cpu_param, non_blocking=True)
+
+    def offload_params_to_cpu(self):
+        """After forward, simply clear the GPU params to free memory"""
+        for gpu_param, cpu_param in self.gpu2cpuCopies.items():
+            # TODO: need to empty gpu parameter
+            # gpu_param.data = torch.empty(0, device=gpu_param.device, dtype=cpu_param.dtype)
+            gpu_param.data.zero_()
+
+
+    def register_model(self, model):
+        """Attach hooks to modules for parameter offloading"""
+        for m in model.modules():
+            m.register_forward_pre_hook(self.forward_prehook)
+            m.register_forward_hook(self.forward_hook)
+            m.register_full_backward_pre_hook(self.backward_pre_hook)
+            m.register_full_backward_hook(self.backward_hook)
+
+    def check_no_gpu_params(self):
+        for gpu_param in self.gpu2cpuCopies.keys():
+            assert gpu_param.data.numel() == 0, f"GPU params not cleared"
+    
+    def check_exists_gpu_params(self):
+        for gpu_param in self.gpu2cpuCopies.keys():
+            assert gpu_param.data.numel() != 0, f"Missing GPU param"
+
+    def forward_prehook(self, module, inputs):
+        """Before forward, load parameters CPU->GPU"""
+        # self.check_no_gpu_params()
+        self.load_params_to_gpu()
+        # self.check_exists_gpu_params()
+
+    def forward_hook(self, module, inputs, output):
+        """After forward, clear GPU params"""
+        # self.check_exists_gpu_params()
+        self.offload_params_to_cpu()
+        # self.check_no_gpu_params()
+
+    def backward_pre_hook(self, module, grad_input):
+        """Before backward, reload params CPU->GPU"""
+        # self.check_no_gpu_params()
+        self.load_params_to_gpu()
+        # self.check_exists_gpu_params()
+
+    def backward_hook(self, module, grad_input, grad_output):
+        """After backward, clear GPU params"""
+        # self.check_exists_gpu_params()
+        self.offload_params_to_cpu()
+        # self.check_no_gpu_params()
+        
+
+    @torch.no_grad()
+    def sync_cpu_to_gpu(self):
+        """Copies updated CPU master copies back to GPU parameters."""
+        for gpu_param, cpu_param in self.gpu2cpuCopies.items():
+            # if gpu_param.data.numel() == 0:
+            #     gpu_param.data = torch.empty_like(cpu_param, device=gpu_param.device)
+            #     gpu_param.data.copy_(cpu_param, non_blocking=True)
+
+            gpu_param.data.copy_(cpu_param, non_blocking=True)
