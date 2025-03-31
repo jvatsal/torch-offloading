@@ -1,4 +1,5 @@
 import os
+import copy
 os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":16:8"
 import torch
 import pytest
@@ -13,11 +14,11 @@ login(token=os.environ["HUGGINGFACE_TOKEN"])
 
 from activation_offloading import OffloadActivations
 
-# torch.backends.cudnn.deterministic = True
-# torch.backends.cudnn.benchmark = False
-# torch.use_deterministic_algorithms(True)
-# torch.backends.cuda.matmul.allow_tf32 = False
-# torch.backends.cudnn.allow_tf32 = False
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+torch.use_deterministic_algorithms(True)
+torch.backends.cuda.matmul.allow_tf32 = False
+torch.backends.cudnn.allow_tf32 = False
 
 def get_model() -> Tuple[AutoModel, Dict[str, torch.Tensor]]:
   """Load pretrained model and tokenize sample input. Returns model & inputs"""
@@ -25,7 +26,10 @@ def get_model() -> Tuple[AutoModel, Dict[str, torch.Tensor]]:
   model = AutoModel.from_pretrained("meta-llama/Llama-3.2-1B").to(dtype=torch.float32, device="cuda")
   # model = AutoModel.from_pretrained("meta-llama/Llama-3.2-1B").to(dtype=torch.bfloat16, device="cuda")
   model.train()
-  inputs = tokenizer("Hello, how are you?", return_tensors="pt").to("cuda")
+  # inputs = tokenizer("Hello, how are you?", return_tensors="pt").to("cuda")
+  inputs = {}
+  inputs["input_ids"] = torch.randint(0, 2000, (2, 4096), dtype=torch.long, device="cuda")
+  inputs["attention_mask"] = torch.ones(2, 4096, dtype=torch.long, device="cuda")
   return model, inputs
 
 def run_model(
@@ -40,7 +44,9 @@ def run_model(
   """
   model.zero_grad()
 
-  with OffloadActivations(min_offload_size=1024, use_pin_memory=True) if use_offloading else contextlib.nullcontext():
+  with OffloadActivations() if use_offloading else contextlib.nullcontext():
+    model.gradient_checkpointing_enable({"use_reentrant": False})
+
     outputs = model(**inputs)
     loss = outputs.last_hidden_state.mean()
     loss.backward()
@@ -57,13 +63,20 @@ def run_model(
 def test_activation_offloading_accuracy() -> None:
   """Runs the model with and without activation offloading and compares the loss and gradients."""
 
-  torch.manual_seed(2024)
   model_no_offloading, inputs_no_offloading = get_model()
-  torch.manual_seed(2024)
-  model_with_offloading, inputs_with_offloading = get_model()
+  model_with_offloading = copy.deepcopy(model_no_offloading)
+  inputs_with_offloading = copy.deepcopy(inputs_no_offloading)
 
-  loss_no_offloading, grad_no_offloading = run_model(model_no_offloading, inputs_no_offloading, use_offloading=False)
-  loss_with_offloading, grad_with_offloading = run_model(model_with_offloading, inputs_with_offloading, use_offloading=True)
+  assert torch.equal(inputs_no_offloading["input_ids"], inputs_with_offloading["input_ids"])
+  assert torch.equal(inputs_no_offloading["attention_mask"], inputs_with_offloading["attention_mask"])
+
+
+  with torch.cuda.nvtx.range("No Offloading"):
+    torch.manual_seed(2024)
+    loss_no_offloading, grad_no_offloading = run_model(model_no_offloading, inputs_no_offloading, use_offloading=False)
+  with torch.cuda.nvtx.range("With Offloading"):
+    torch.manual_seed(2024)
+    loss_with_offloading, grad_with_offloading = run_model(model_with_offloading, inputs_with_offloading, use_offloading=True)
 
   atol = rtol = 1e-5
 
@@ -91,3 +104,6 @@ def test_activation_offloading_accuracy() -> None:
   gc.collect()
   print(torch.cuda.memory_summary(device=None, abbreviated=False))
   print("passed!")
+
+if __name__ == "__main__":
+  test_activation_offloading_accuracy()
